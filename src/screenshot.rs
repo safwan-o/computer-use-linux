@@ -457,7 +457,7 @@ async fn capture_with_portal() -> Result<RawScreenshotCapture> {
 /// Upper bound on how long we wait for the companion extension to answer
 /// before falling through to the next backend. Matches the portal timeout:
 /// a hung capture must not block the tool forever.
-const SHELL_EXTENSION_TIMEOUT = Duration::from_secs(20);
+const SHELL_EXTENSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Upper bound on how long we wait for `gnome-screenshot` before killing it.
 /// Matches the portal timeout: a hung capture must not block the tool forever.
