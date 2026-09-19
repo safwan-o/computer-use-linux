@@ -236,7 +236,7 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // unknown bus names, and the portal cancels with response code 2 when it
     // cannot show its approval dialog without a focused app window.
     // gnome-screenshot works regardless when installed, so it stays the
-    // final fallback. See issues #1 and #20.
+    // final fallback. See #1 (and upstream agent-sh/computer-use-linux#20).
     let mut failures = Vec::new();
     for backend in DEFAULT_SCREENSHOT_CHAIN {
         match backend.capture().await {
