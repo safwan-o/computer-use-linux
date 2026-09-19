@@ -1,5 +1,4 @@
 use crate::diagnostics::hydrate_session_bus_env;
-use crate::identity;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
