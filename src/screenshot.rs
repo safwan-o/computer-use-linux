@@ -342,10 +342,18 @@ async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
     let filename = path
         .to_str()
         .context("temporary screenshot path is not valid UTF-8")?;
-    let (ok, message): (bool, String) = proxy
-        .call("CaptureScreenshot", &(false, filename))
-        .await
-        .context("companion extension CaptureScreenshot call failed")?;
+    let call = proxy.call("CaptureScreenshot", &(false, filename));
+    let (ok, message): (bool, String) = match tokio::time::timeout(SHELL_EXTENSION_TIMEOUT, call).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            cleanup_gnome_requested_path(&path);
+            return Err(error).context("companion extension CaptureScreenshot call failed");
+        }
+        Err(_) => {
+            cleanup_gnome_requested_path(&path);
+            bail!("companion extension screenshot timed out");
+        }
+    };
     if !ok {
         cleanup_gnome_requested_path(&path);
         bail!("companion extension screenshot failed: {message}");
@@ -445,6 +453,11 @@ async fn capture_with_portal() -> Result<RawScreenshotCapture> {
 
     read_png_as_capture(path, "xdg-desktop-portal", ScreenshotCleanup::Preserve).await
 }
+
+/// Upper bound on how long we wait for the companion extension to answer
+/// before falling through to the next backend. Matches the portal timeout:
+/// a hung capture must not block the tool forever.
+const SHELL_EXTENSION_TIMEOUT = Duration::from_secs(20);
 
 /// Upper bound on how long we wait for `gnome-screenshot` before killing it.
 /// Matches the portal timeout: a hung capture must not block the tool forever.
