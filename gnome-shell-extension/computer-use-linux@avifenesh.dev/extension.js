@@ -36,6 +36,12 @@ const WINDOW_CONTROL_XML = `
       <arg name="ok" type="b" direction="out"/>
       <arg name="message" type="s" direction="out"/>
     </method>
+    <method name="CaptureScreenshot">
+      <arg name="include_cursor" type="b" direction="in"/>
+      <arg name="filename" type="s" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
     <method name="GetMonitorLayout">
       <arg name="json" type="s" direction="out"/>
     </method>
@@ -103,6 +109,40 @@ class WindowControlDBus extends GObject.Object {
                 false,
                 `Activation failed: ${error.message}`,
             ]));
+        }
+    }
+
+    CaptureScreenshotAsync([includeCursor, filename], invocation) {
+        const done = (ok, message) => invocation.return_value(new GLib.Variant('(bs)', [ok, message]));
+        const fail = message => done(false, message);
+        try {
+            if (typeof filename !== 'string' || !GLib.path_is_absolute(filename)) {
+                fail('CaptureScreenshot requires an absolute filename');
+                return;
+            }
+            // Shell.Screenshot is already promisified by GNOME Shell itself
+            // (see js/ui/screenshot.js), so this resolves to a Promise here.
+            const shooter = new Shell.Screenshot();
+            const stream = Gio.File.new_for_path(filename)
+                .replace(null, false, Gio.FileCreateFlags.NONE, null);
+            shooter.screenshot(includeCursor === true, stream).then(() => {
+                try {
+                    stream.close(null);
+                } catch (closeError) {
+                    fail(`Screenshot stream close failed: ${closeError.message}`);
+                    return;
+                }
+                done(true, `Captured screenshot to ${filename}`);
+            }, error => {
+                try {
+                    stream.close(null);
+                } catch (closeError) {
+                    /* ignore close errors after a failed capture */
+                }
+                fail(`Screenshot capture failed: ${error.message ?? error}`);
+            });
+        } catch (error) {
+            fail(`Screenshot setup failed: ${error.message ?? error}`);
         }
     }
 
