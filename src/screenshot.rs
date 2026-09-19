@@ -347,7 +347,7 @@ async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
         .call("CaptureScreenshot", &(false, filename))
         .await
         .context("companion extension CaptureScreenshot call failed")?;
-    if (!ok) {
+    if !ok {
         cleanup_gnome_requested_path(&path);
         bail!("companion extension screenshot failed: {message}");
     }
@@ -846,6 +846,7 @@ mod tests {
     #[test]
     fn aggregated_error_names_backends_and_points_at_remedies() {
         let failures = vec![
+            BackendFailure { backend: ScreenshotBackend::ShellExtension, error: anyhow!("companion extension CaptureScreenshot call failed") },
             BackendFailure { backend: ScreenshotBackend::GnomeShell, error: anyhow!("AccessDenied: Screenshot is not allowed") },
             BackendFailure { backend: ScreenshotBackend::Portal, error: anyhow!("denied or cancelled with response code 2") },
             BackendFailure { backend: ScreenshotBackend::GnomeScreenshot, error: anyhow!("failed to spawn gnome-screenshot") },
