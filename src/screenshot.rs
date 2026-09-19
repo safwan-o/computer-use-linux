@@ -342,7 +342,8 @@ async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
     let filename = path
         .to_str()
         .context("temporary screenshot path is not valid UTF-8")?;
-    let call = proxy.call("CaptureScreenshot", &(false, filename));
+    let args = (false, filename);
+    let call = proxy.call("CaptureScreenshot", &args);
     let (ok, message): (bool, String) = match tokio::time::timeout(SHELL_EXTENSION_TIMEOUT, call).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
