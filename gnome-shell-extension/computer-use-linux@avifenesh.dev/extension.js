@@ -125,7 +125,17 @@ class WindowControlDBus extends GObject.Object {
             const shooter = new Shell.Screenshot();
             const stream = Gio.File.new_for_path(filename)
                 .replace(null, false, Gio.FileCreateFlags.NONE, null);
-            shooter.screenshot(includeCursor === true, stream).then(() => {
+            const pending = shooter.screenshot(includeCursor === true, stream);
+            if (!pending || typeof pending.then !== 'function') {
+                try {
+                    stream.close(null);
+                } catch (closeError) {
+                    /* ignore close errors after a failed capture */
+                }
+                fail('Screenshot API did not return a Promise; unsupported GNOME Shell version');
+                return;
+            }
+            pending.then(() => {
                 try {
                     stream.close(null);
                 } catch (closeError) {
