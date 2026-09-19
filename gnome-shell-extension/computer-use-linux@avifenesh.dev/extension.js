@@ -116,8 +116,10 @@ class WindowControlDBus extends GObject.Object {
         const done = (ok, message) => invocation.return_value(new GLib.Variant('(bs)', [ok, message]));
         const fail = message => done(false, message);
         try {
-            if (typeof filename !== 'string' || !GLib.path_is_absolute(filename)) {
-                fail('CaptureScreenshot requires an absolute filename');
+            const tmpDir = GLib.get_tmp_dir();
+            if (typeof filename !== 'string' || !GLib.path_is_absolute(filename) ||
+                (filename !== tmpDir && !filename.startsWith(tmpDir + '/'))) {
+                fail('CaptureScreenshot requires a filename inside the system temporary directory');
                 return;
             }
             // Shell.Screenshot is already promisified by GNOME Shell itself
