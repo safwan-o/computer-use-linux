@@ -1,4 +1,5 @@
 use crate::diagnostics::hydrate_session_bus_env;
+use crate::identity;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
@@ -144,11 +145,12 @@ impl ScreenshotPayloadOptions {
 }
 
 /// Environment variable forcing a single capture backend, skipping the
-/// fallback chain. Accepts `gnome-shell`, `portal`, or `gnome-screenshot`.
+/// fallback chain. Accepts `shell-extension`, `gnome-shell`, `portal`, or `gnome-screenshot`.
 const SCREENSHOT_BACKEND_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenshotBackend {
+    ShellExtension,
     GnomeShell,
     Portal,
     GnomeScreenshot,
@@ -157,6 +159,7 @@ enum ScreenshotBackend {
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "shell-extension" | "shell_extension" | "extension" => Some(Self::ShellExtension),
             "gnome-shell" | "gnome_shell" | "shell" => Some(Self::GnomeShell),
             "portal" | "xdg-portal" | "xdg_portal" => Some(Self::Portal),
             "gnome-screenshot" | "gnome_screenshot" => Some(Self::GnomeScreenshot),
@@ -166,6 +169,7 @@ impl ScreenshotBackend {
 
     async fn capture(self) -> Result<RawScreenshotCapture> {
         match self {
+            Self::ShellExtension => capture_with_shell_extension().await,
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::Portal => capture_with_portal().await,
             Self::GnomeScreenshot => capture_with_gnome_screenshot().await,
@@ -176,6 +180,7 @@ impl ScreenshotBackend {
 impl ScreenshotBackend {
     fn name(self) -> &'static str {
         match self {
+            Self::ShellExtension => "shell-extension",
             Self::GnomeShell => "gnome-shell",
             Self::Portal => "xdg-desktop-portal",
             Self::GnomeScreenshot => "gnome-screenshot",
@@ -186,7 +191,8 @@ impl ScreenshotBackend {
 /// Default capture order, tried front to back by capture_screenshot_raw.
 /// New backends (e.g. a PipeWire ScreenCast backend for background callers,
 /// see issue #1) slot in here without touching the fallback loop.
-const DEFAULT_SCREENSHOT_CHAIN: [ScreenshotBackend; 3] = [
+const DEFAULT_SCREENSHOT_CHAIN: [ScreenshotBackend; 4] = [
+    ScreenshotBackend::ShellExtension,
     ScreenshotBackend::GnomeShell,
     ScreenshotBackend::Portal,
     ScreenshotBackend::GnomeScreenshot,
@@ -315,6 +321,43 @@ pub fn prepare_screenshot_payload(
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
+}
+
+async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
+    // In-process capture through the companion GNOME Shell extension: no
+    // D-Bus sender check and no portal approval dialog, so this works for
+    // background callers whenever the extension is active. Falls through to
+    // the other backends when the extension API is unavailable.
+    let connection = zbus::Connection::session()
+        .await
+        .context("failed to connect to session bus")?;
+    let proxy = Proxy::new(
+        &connection,
+        crate::identity::DBUS_SERVICE,
+        crate::identity::DBUS_OBJECT_PATH,
+        crate::identity::DBUS_SERVICE,
+    )
+    .await
+    .context("failed to create companion extension screenshot proxy")?;
+    let path = temp_png_path("shell-extension");
+    let filename = path
+        .to_str()
+        .context("temporary screenshot path is not valid UTF-8")?;
+    let (ok, message): (bool, String) = proxy
+        .call("CaptureScreenshot", &(false, filename))
+        .await
+        .context("companion extension CaptureScreenshot call failed")?;
+    if (!ok) {
+        cleanup_gnome_requested_path(&path);
+        bail!("companion extension screenshot failed: {message}");
+    }
+
+    read_png_as_capture(
+        path.clone(),
+        "shell-extension",
+        ScreenshotCleanup::DeletePath(path),
+    )
+    .await
 }
 
 async fn capture_with_gnome_shell() -> Result<RawScreenshotCapture> {
@@ -778,6 +821,10 @@ mod tests {
             ScreenshotBackend::parse("GNOME_SCREENSHOT"),
             Some(ScreenshotBackend::GnomeScreenshot)
         );
+        assert_eq!(
+            ScreenshotBackend::parse("shell-extension"),
+            Some(ScreenshotBackend::ShellExtension)
+        );
         assert_eq!(ScreenshotBackend::parse("nonsense"), None);
     }
 
@@ -786,13 +833,14 @@ mod tests {
         assert_eq!(
             DEFAULT_SCREENSHOT_CHAIN,
             [
+                ScreenshotBackend::ShellExtension,
                 ScreenshotBackend::GnomeShell,
                 ScreenshotBackend::Portal,
                 ScreenshotBackend::GnomeScreenshot,
             ]
         );
         let names: Vec<_> = DEFAULT_SCREENSHOT_CHAIN.iter().map(|b| b.name()).collect();
-        assert_eq!(names, ["gnome-shell", "xdg-desktop-portal", "gnome-screenshot"]);
+        assert_eq!(names, ["shell-extension", "gnome-shell", "xdg-desktop-portal", "gnome-screenshot"]);
     }
 
     #[test]
