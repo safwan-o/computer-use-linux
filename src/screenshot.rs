@@ -1036,6 +1036,34 @@ mod tests {
     }
 
     #[test]
+    fn user_dirs_pictures_parsing() {
+        let home = std::env::var_os("HOME").expect("HOME is set");
+        let home_str = home.to_string_lossy().into_owned();
+        let file = std::env::temp_dir().join(format!(
+            "computer-use-linux-user-dirs-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::write(
+            &file,
+            format!(
+                "# comment\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_PICTURES_DIR=\"$HOME/Pics\"\n",
+                home_str
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        fs::write(&file, "XDG_PICTURES_DIR=\"$HOME\"").unwrap();
+        assert_eq!(parse_user_dirs_pictures(&file), None);
+        fs::write(&file, "# only comments\n").unwrap();
+        assert_eq!(parse_user_dirs_pictures(&file), None);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
     fn hotkey_lookup_rejects_missing_dir() {
         let missing = std::env::temp_dir().join(format!(
             "computer-use-linux-hotkey-missing-{}-{}",
