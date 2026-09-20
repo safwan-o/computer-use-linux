@@ -1038,7 +1038,6 @@ mod tests {
     #[test]
     fn user_dirs_pictures_parsing() {
         let home = std::env::var_os("HOME").expect("HOME is set");
-        let home_str = home.to_string_lossy().into_owned();
         let file = std::env::temp_dir().join(format!(
             "computer-use-linux-user-dirs-test-{}-{}",
             std::process::id(),
@@ -1046,10 +1045,7 @@ mod tests {
         ));
         fs::write(
             &file,
-            format!(
-                "# comment\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_PICTURES_DIR=\"$HOME/Pics\"\n",
-                home_str
-            ),
+            "# comment\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_PICTURES_DIR=\"$HOME/Pics\"\n",
         )
         .unwrap();
         assert_eq!(
