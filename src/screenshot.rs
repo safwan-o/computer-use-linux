@@ -1080,6 +1080,71 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_lookup_skips_non_files_and_broken_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-edge-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("shot.png");
+        fs::write(&fresh, b"fresh").unwrap();
+        let upper = dir.join("UP.PNG");
+        fs::write(&upper, b"upper").unwrap();
+        // Newest mtime on purpose: without the file-type guard this decoy wins.
+        fs::create_dir_all(dir.join("folder.png")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone.png"), dir.join("link.png")).unwrap();
+        let since = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
+        let found = find_newest_png_newer_than(&dir, since).unwrap();
+        assert!(found == fresh || found == upper);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_lookup_empty_dir_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-empty-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(find_newest_png_newer_than(&dir, SystemTime::UNIX_EPOCH).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_dirs_pictures_accepts_common_forms() {
+        let home = std::env::var_os("HOME").expect("HOME is set");
+        let file = std::env::temp_dir().join(format!(
+            "computer-use-linux-user-dirs-forms-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        // Unquoted value.
+        fs::write(&file, "XDG_PICTURES_DIR=$HOME/Pics\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        // Braced variable and CRLF endings.
+        fs::write(&file, "XDG_PICTURES_DIR=${HOME}/Pics\r\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        // Relative values resolve against $HOME.
+        fs::write(&file, "XDG_PICTURES_DIR=MyPics\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("MyPics"))
+        );
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
     fn aggregated_error_names_backends_and_points_at_remedies() {
         let failures = vec![
             BackendFailure { backend: ScreenshotBackend::ShellExtension, error: anyhow!("companion extension CaptureScreenshot call failed") },
