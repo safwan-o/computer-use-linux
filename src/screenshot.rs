@@ -933,6 +933,59 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_backend_is_opt_in_only() {
+        assert_eq!(chain_with_opt_in(false), DEFAULT_SCREENSHOT_CHAIN.to_vec());
+        let mut expected = DEFAULT_SCREENSHOT_CHAIN.to_vec();
+        expected.push(ScreenshotBackend::HotkeyFile);
+        assert_eq!(chain_with_opt_in(true), expected);
+    }
+
+    #[test]
+    fn parses_hotkey_backend_names() {
+        assert_eq!(
+            ScreenshotBackend::parse("hotkey"),
+            Some(ScreenshotBackend::HotkeyFile)
+        );
+        assert_eq!(
+            ScreenshotBackend::parse("hotkey-file"),
+            Some(ScreenshotBackend::HotkeyFile)
+        );
+        assert_eq!(ScreenshotBackend::HotkeyFile.name(), "hotkey-file");
+    }
+
+    #[test]
+    fn hotkey_lookup_finds_only_fresh_pngs() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("old.png"), b"stale").unwrap();
+        fs::write(dir.join("notes.txt"), b"not a png").unwrap();
+        // Capture `since` after the decoys so only the fresh file qualifies.
+        let since = SystemTime::now();
+        let fresh = dir.join("new.png");
+        fs::write(&fresh, b"fresh").unwrap();
+
+        assert_eq!(find_newest_png_newer_than(&dir, since).unwrap(), fresh);
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert!(find_newest_png_newer_than(&dir, future).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_lookup_rejects_missing_dir() {
+        let missing = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-missing-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        assert!(find_newest_png_newer_than(&missing, SystemTime::UNIX_EPOCH).is_err());
+    }
+
+    #[test]
     fn aggregated_error_names_backends_and_points_at_remedies() {
         let failures = vec![
             BackendFailure { backend: ScreenshotBackend::ShellExtension, error: anyhow!("companion extension CaptureScreenshot call failed") },
