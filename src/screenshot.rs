@@ -147,18 +147,29 @@ impl ScreenshotPayloadOptions {
 /// fallback chain. Accepts `shell-extension`, `gnome-shell`, `portal`, or `gnome-screenshot`.
 const SCREENSHOT_BACKEND_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND";
 
+/// Opt-in hotkey fallback: when set (value documents the bound GNOME key),
+/// the `hotkey-file` backend runs last and reads back the freshest PNG from
+/// ~/Pictures/Screenshots. The caller must trigger the hotkey first, then
+/// call capture promptly; see issue #3.
+const HOTKEY_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY";
+/// Freshness window for the hotkey fallback: only screenshots newer than
+/// this count, so a stale file is never returned as a fresh capture.
+const HOTKEY_FRESHNESS: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenshotBackend {
     ShellExtension,
     GnomeShell,
     Portal,
     GnomeScreenshot,
+    HotkeyFile,
 }
 
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "shell-extension" | "shell_extension" | "extension" => Some(Self::ShellExtension),
+            "hotkey" | "hotkey-file" | "hotkey_file" => Some(Self::HotkeyFile),
             "gnome-shell" | "gnome_shell" | "shell" => Some(Self::GnomeShell),
             "portal" | "xdg-portal" | "xdg_portal" => Some(Self::Portal),
             "gnome-screenshot" | "gnome_screenshot" => Some(Self::GnomeScreenshot),
@@ -169,6 +180,7 @@ impl ScreenshotBackend {
     async fn capture(self) -> Result<RawScreenshotCapture> {
         match self {
             Self::ShellExtension => capture_with_shell_extension().await,
+            Self::HotkeyFile => capture_with_hotkey_file().await,
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::Portal => capture_with_portal().await,
             Self::GnomeScreenshot => capture_with_gnome_screenshot().await,
@@ -180,6 +192,7 @@ impl ScreenshotBackend {
     fn name(self) -> &'static str {
         match self {
             Self::ShellExtension => "shell-extension",
+            Self::HotkeyFile => "hotkey-file",
             Self::GnomeShell => "gnome-shell",
             Self::Portal => "xdg-desktop-portal",
             Self::GnomeScreenshot => "gnome-screenshot",
@@ -196,6 +209,21 @@ const DEFAULT_SCREENSHOT_CHAIN: [ScreenshotBackend; 4] = [
     ScreenshotBackend::Portal,
     ScreenshotBackend::GnomeScreenshot,
 ];
+
+/// Capture order for capture_screenshot_raw: the default chain plus the
+/// hotkey fallback when explicitly opted in. Kept as a function (not a
+/// longer const) so the default path stays allocation-free and obvious.
+fn chain_with_opt_in(hotkey_opt_in: bool) -> Vec<ScreenshotBackend> {
+    let mut chain = DEFAULT_SCREENSHOT_CHAIN.to_vec();
+    if hotkey_opt_in {
+        chain.push(ScreenshotBackend::HotkeyFile);
+    }
+    chain
+}
+
+fn hotkey_opt_in() -> bool {
+    matches!(std::env::var(HOTKEY_ENV), Ok(value) if !value.trim().is_empty())
+}
 
 #[derive(Debug)]
 struct BackendFailure {
@@ -216,7 +244,7 @@ fn actionable_screenshot_error(failures: &[BackendFailure]) -> anyhow::Error {
         message.push_str(&format!(" {} failed: {:#};", failure.backend.name(), failure.error));
     }
     message.push_str(
-        " Remedies: focus a window and approve the portal dialog once; install gnome-screenshot as a fallback; pin a single backend with COMPUTER_USE_LINUX_SCREENSHOT_BACKEND to debug; or as a manual fallback bind a GNOME screenshot hotkey and read back ~/Pictures/Screenshots. See issue #1."
+        " Remedies: focus a window and approve the portal dialog once; install gnome-screenshot as a fallback; pin a single backend with COMPUTER_USE_LINUX_SCREENSHOT_BACKEND to debug; or set COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY after binding a GNOME screenshot hotkey (reads back ~/Pictures/Screenshots). See issues #1 and #3."
     );
     anyhow!("{}", message)
 }
@@ -237,8 +265,9 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // cannot show its approval dialog without a focused app window.
     // gnome-screenshot works regardless when installed, so it stays the
     // final fallback. See #1 (and upstream agent-sh/computer-use-linux#20).
+    let chain = chain_with_opt_in(hotkey_opt_in());
     let mut failures = Vec::new();
-    for backend in DEFAULT_SCREENSHOT_CHAIN {
+    for backend in chain {
         match backend.capture().await {
             Ok(capture) => return Ok(capture),
             Err(error) => failures.push(BackendFailure { backend, error }),
@@ -320,6 +349,53 @@ pub fn prepare_screenshot_payload(
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
+}
+
+fn screenshots_dir() -> Option<PathBuf> {
+    let pictures = std::env::var_os("XDG_PICTURES_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures")))?;
+    Some(pictures.join("Screenshots"))
+}
+
+/// Newest `.png` in `dir` modified after `since`. Pure filesystem lookup so it
+/// stays unit-testable; the hotkey trigger itself belongs to the caller.
+fn find_newest_png_newer_than(dir: &Path, since: SystemTime) -> Result<PathBuf> {
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("cannot list screenshot directory {}", dir.display()))?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot read entry in {}", dir.display()))?;
+        let path = entry.path();
+        let is_png = matches!(path.extension().and_then(|ext| ext.to_str()), Some(ext) if ext.eq_ignore_ascii_case("png"));
+        if !is_png {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .with_context(|| format!("cannot stat {}", path.display()))?;
+        let newer = match &best {
+            Some((t, _)) => mtime > *t,
+            None => true,
+        };
+        if mtime > since && newer {
+            best = Some((mtime, path));
+        }
+    }
+    best
+        .map(|(_, path)| path)
+        .with_context(|| format!("no fresh screenshot in {}", dir.display()))
+}
+
+async fn capture_with_hotkey_file() -> Result<RawScreenshotCapture> {
+    let dir = screenshots_dir().context("could not resolve Pictures directory")?;
+    let since = SystemTime::now()
+        .checked_sub(HOTKEY_FRESHNESS)
+        .context("system clock is before the hotkey freshness window")?;
+    let path = find_newest_png_newer_than(&dir, since)?;
+    // Preserve: this is the user's own screenshot file, never delete it.
+    read_png_as_capture(path, "hotkey-file", ScreenshotCleanup::Preserve).await
 }
 
 async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
