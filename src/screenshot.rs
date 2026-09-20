@@ -147,18 +147,29 @@ impl ScreenshotPayloadOptions {
 /// fallback chain. Accepts `shell-extension`, `gnome-shell`, `portal`, or `gnome-screenshot`.
 const SCREENSHOT_BACKEND_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND";
 
+/// Opt-in hotkey fallback: when set (value documents the bound GNOME key),
+/// the `hotkey-file` backend runs last and reads back the freshest PNG from
+/// screenshots folder (XDG user dirs, else ~/Pictures/Screenshots). The caller must trigger the hotkey first, then
+/// call capture promptly; see issue #3.
+const HOTKEY_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY";
+/// Freshness window for the hotkey fallback: only screenshots newer than
+/// this count, so a stale file is never returned as a fresh capture.
+const HOTKEY_FRESHNESS: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenshotBackend {
     ShellExtension,
     GnomeShell,
     Portal,
     GnomeScreenshot,
+    HotkeyFile,
 }
 
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "shell-extension" | "shell_extension" | "extension" => Some(Self::ShellExtension),
+            "hotkey" | "hotkey-file" | "hotkey_file" => Some(Self::HotkeyFile),
             "gnome-shell" | "gnome_shell" | "shell" => Some(Self::GnomeShell),
             "portal" | "xdg-portal" | "xdg_portal" => Some(Self::Portal),
             "gnome-screenshot" | "gnome_screenshot" => Some(Self::GnomeScreenshot),
@@ -169,6 +180,7 @@ impl ScreenshotBackend {
     async fn capture(self) -> Result<RawScreenshotCapture> {
         match self {
             Self::ShellExtension => capture_with_shell_extension().await,
+            Self::HotkeyFile => capture_with_hotkey_file().await,
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::Portal => capture_with_portal().await,
             Self::GnomeScreenshot => capture_with_gnome_screenshot().await,
@@ -180,6 +192,7 @@ impl ScreenshotBackend {
     fn name(self) -> &'static str {
         match self {
             Self::ShellExtension => "shell-extension",
+            Self::HotkeyFile => "hotkey-file",
             Self::GnomeShell => "gnome-shell",
             Self::Portal => "xdg-desktop-portal",
             Self::GnomeScreenshot => "gnome-screenshot",
@@ -196,6 +209,21 @@ const DEFAULT_SCREENSHOT_CHAIN: [ScreenshotBackend; 4] = [
     ScreenshotBackend::Portal,
     ScreenshotBackend::GnomeScreenshot,
 ];
+
+/// Capture order for capture_screenshot_raw: the default chain plus the
+/// hotkey fallback when explicitly opted in. Kept as a function (not a
+/// longer const) so the default path stays allocation-free and obvious.
+fn chain_with_opt_in(hotkey_opt_in: bool) -> Vec<ScreenshotBackend> {
+    let mut chain = DEFAULT_SCREENSHOT_CHAIN.to_vec();
+    if hotkey_opt_in {
+        chain.push(ScreenshotBackend::HotkeyFile);
+    }
+    chain
+}
+
+fn hotkey_opt_in() -> bool {
+    matches!(std::env::var(HOTKEY_ENV), Ok(value) if !value.trim().is_empty())
+}
 
 #[derive(Debug)]
 struct BackendFailure {
@@ -216,7 +244,7 @@ fn actionable_screenshot_error(failures: &[BackendFailure]) -> anyhow::Error {
         message.push_str(&format!(" {} failed: {:#};", failure.backend.name(), failure.error));
     }
     message.push_str(
-        " Remedies: focus a window and approve the portal dialog once; install gnome-screenshot as a fallback; pin a single backend with COMPUTER_USE_LINUX_SCREENSHOT_BACKEND to debug; or as a manual fallback bind a GNOME screenshot hotkey and read back ~/Pictures/Screenshots. See issue #1."
+        " Remedies: focus a window and approve the portal dialog once; install gnome-screenshot as a fallback; pin a single backend with COMPUTER_USE_LINUX_SCREENSHOT_BACKEND to debug; or set COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY after binding a GNOME screenshot hotkey (reads back ~/Pictures/Screenshots). See issues #1 and #3."
     );
     anyhow!("{}", message)
 }
@@ -236,9 +264,11 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // unknown bus names, and the portal cancels with response code 2 when it
     // cannot show its approval dialog without a focused app window.
     // gnome-screenshot works regardless when installed, so it stays the
-    // final fallback. See #1 (and upstream agent-sh/computer-use-linux#20).
+    // final automatic fallback; only the opt-in hotkey backend runs after it.
+    // See #1 (and upstream agent-sh/computer-use-linux#20).
+    let chain = chain_with_opt_in(hotkey_opt_in());
     let mut failures = Vec::new();
-    for backend in DEFAULT_SCREENSHOT_CHAIN {
+    for backend in chain {
         match backend.capture().await {
             Ok(capture) => return Ok(capture),
             Err(error) => failures.push(BackendFailure { backend, error }),
@@ -320,6 +350,109 @@ pub fn prepare_screenshot_payload(
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
+}
+
+fn screenshots_dir() -> Option<PathBuf> {
+    let pictures = user_pictures_dir().or_else(|| {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures"))
+    })?;
+    Some(pictures.join("Screenshots"))
+}
+
+/// Pictures dir honoring an explicit `XDG_PICTURES_DIR` override, then the
+/// `XDG_PICTURES_DIR` entry of `user-dirs.dirs`. Pure apart from env reads
+/// (no mutation), so it stays parallel-test safe.
+fn user_pictures_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_PICTURES_DIR").map(PathBuf::from) {
+        return Some(dir);
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    parse_user_dirs_pictures(&config.join("user-dirs.dirs"))
+}
+
+/// `XDG_PICTURES_DIR` value from a `user-dirs.dirs` file, with `$HOME`
+/// expansion. A value equal to `$HOME` means disabled per the spec and is
+/// skipped. Pure for unit tests.
+fn parse_user_dirs_pictures(path: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home_str = home.to_string_lossy();
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("XDG_PICTURES_DIR=") else {
+            continue;
+        };
+        let value = rest.trim().trim_matches('"');
+        if value.is_empty() {
+            continue;
+        }
+        let expanded = value.replace("${HOME}", &home_str).replace("$HOME", &home_str);
+        if expanded == home_str {
+            continue;
+        }
+        let expanded = PathBuf::from(expanded);
+        return Some(if expanded.is_absolute() {
+            expanded
+        } else {
+            PathBuf::from(&home).join(expanded)
+        });
+    }
+    None
+}
+
+/// Newest `.png` in `dir` modified after `since`. Pure filesystem lookup so it
+/// stays unit-testable; the hotkey trigger itself belongs to the caller.
+fn find_newest_png_newer_than(dir: &Path, since: SystemTime) -> Result<PathBuf> {
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("cannot list screenshot directory {}", dir.display()))?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        // Skip (rather than fail on) unreadable entries: this scans a
+        // user-owned directory as a last resort, where a broken symlink
+        // or stray entry must not sink the whole lookup.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let is_png = matches!(path.extension().and_then(|ext| ext.to_str()), Some(ext) if ext.eq_ignore_ascii_case("png"));
+        if !is_png {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let newer = match &best {
+            Some((t, _)) => mtime > *t,
+            None => true,
+        };
+        if mtime > since && newer {
+            best = Some((mtime, path));
+        }
+    }
+    best
+        .map(|(_, path)| path)
+        .with_context(|| format!("no fresh screenshot in {}", dir.display()))
+}
+
+async fn capture_with_hotkey_file() -> Result<RawScreenshotCapture> {
+    let dir = screenshots_dir().context("could not resolve Pictures directory")?;
+    let since = SystemTime::now()
+        .checked_sub(HOTKEY_FRESHNESS)
+        .context("system clock is before the hotkey freshness window")?;
+    let path = find_newest_png_newer_than(&dir, since)?;
+    // Preserve: this is the user's own screenshot file, never delete it.
+    read_png_as_capture(path, "hotkey-file", ScreenshotCleanup::Preserve).await
 }
 
 async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
@@ -854,6 +987,161 @@ mod tests {
         );
         let names: Vec<_> = DEFAULT_SCREENSHOT_CHAIN.iter().map(|b| b.name()).collect();
         assert_eq!(names, ["shell-extension", "gnome-shell", "xdg-desktop-portal", "gnome-screenshot"]);
+    }
+
+    #[test]
+    fn hotkey_backend_is_opt_in_only() {
+        assert_eq!(chain_with_opt_in(false), DEFAULT_SCREENSHOT_CHAIN.to_vec());
+        let mut expected = DEFAULT_SCREENSHOT_CHAIN.to_vec();
+        expected.push(ScreenshotBackend::HotkeyFile);
+        assert_eq!(chain_with_opt_in(true), expected);
+    }
+
+    #[test]
+    fn parses_hotkey_backend_names() {
+        assert_eq!(
+            ScreenshotBackend::parse("hotkey"),
+            Some(ScreenshotBackend::HotkeyFile)
+        );
+        assert_eq!(
+            ScreenshotBackend::parse("hotkey-file"),
+            Some(ScreenshotBackend::HotkeyFile)
+        );
+        assert_eq!(ScreenshotBackend::HotkeyFile.name(), "hotkey-file");
+    }
+
+    #[test]
+    fn hotkey_lookup_finds_only_fresh_pngs() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // Age the decoy explicitly instead of relying on filesystem timestamp
+        // granularity between consecutive writes.
+        let old = dir.join("old.png");
+        fs::write(&old, b"stale").unwrap();
+        let aged = SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        fs::write(dir.join("notes.txt"), b"not a png").unwrap();
+        let since = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
+        let fresh = dir.join("new.png");
+        fs::write(&fresh, b"fresh").unwrap();
+
+        assert_eq!(find_newest_png_newer_than(&dir, since).unwrap(), fresh);
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert!(find_newest_png_newer_than(&dir, future).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_dirs_pictures_parsing() {
+        let home = std::env::var_os("HOME").expect("HOME is set");
+        let file = std::env::temp_dir().join(format!(
+            "computer-use-linux-user-dirs-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::write(
+            &file,
+            "# comment\nXDG_DOCUMENTS_DIR=\"$HOME/Documents\"\nXDG_PICTURES_DIR=\"$HOME/Pics\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        fs::write(&file, "XDG_PICTURES_DIR=\"$HOME\"").unwrap();
+        assert_eq!(parse_user_dirs_pictures(&file), None);
+        fs::write(&file, "# only comments\n").unwrap();
+        assert_eq!(parse_user_dirs_pictures(&file), None);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn hotkey_lookup_rejects_missing_dir() {
+        let missing = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-missing-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        assert!(find_newest_png_newer_than(&missing, SystemTime::UNIX_EPOCH).is_err());
+    }
+
+    #[test]
+    fn hotkey_lookup_skips_non_files_and_broken_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-edge-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("shot.png");
+        fs::write(&fresh, b"fresh").unwrap();
+        let upper = dir.join("UP.PNG");
+        fs::write(&upper, b"upper").unwrap();
+        // Newest mtime on purpose: without the file-type guard this decoy wins.
+        fs::create_dir_all(dir.join("folder.png")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone.png"), dir.join("link.png")).unwrap();
+        let since = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
+        let found = find_newest_png_newer_than(&dir, since).unwrap();
+        assert!(found == fresh || found == upper);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_lookup_empty_dir_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "computer-use-linux-hotkey-empty-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(find_newest_png_newer_than(&dir, SystemTime::UNIX_EPOCH).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_dirs_pictures_accepts_common_forms() {
+        let home = std::env::var_os("HOME").expect("HOME is set");
+        let file = std::env::temp_dir().join(format!(
+            "computer-use-linux-user-dirs-forms-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        // Unquoted value.
+        fs::write(&file, "XDG_PICTURES_DIR=$HOME/Pics\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        // Braced variable and CRLF endings.
+        fs::write(&file, "XDG_PICTURES_DIR=${HOME}/Pics\r\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("Pics"))
+        );
+        // Relative values resolve against $HOME.
+        fs::write(&file, "XDG_PICTURES_DIR=MyPics\n").unwrap();
+        assert_eq!(
+            parse_user_dirs_pictures(&file),
+            Some(PathBuf::from(&home).join("MyPics"))
+        );
+        let _ = fs::remove_file(&file);
     }
 
     #[test]
