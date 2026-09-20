@@ -961,10 +961,23 @@ mod tests {
             unique_suffix()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("old.png"), b"stale").unwrap();
+        // Age the decoy explicitly instead of relying on filesystem timestamp
+        // granularity between consecutive writes.
+        let old = dir.join("old.png");
+        fs::write(&old, b"stale").unwrap();
+        let aged = SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
         fs::write(dir.join("notes.txt"), b"not a png").unwrap();
-        // Capture `since` after the decoys so only the fresh file qualifies.
-        let since = SystemTime::now();
+        let since = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap();
         let fresh = dir.join("new.png");
         fs::write(&fresh, b"fresh").unwrap();
 
