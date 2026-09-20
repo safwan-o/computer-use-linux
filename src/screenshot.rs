@@ -412,16 +412,26 @@ fn find_newest_png_newer_than(dir: &Path, since: SystemTime) -> Result<PathBuf> 
         .with_context(|| format!("cannot list screenshot directory {}", dir.display()))?;
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for entry in entries {
-        let entry = entry.with_context(|| format!("cannot read entry in {}", dir.display()))?;
+        // Skip (rather than fail on) unreadable entries: this scans a
+        // user-owned directory as a last resort, where a broken symlink
+        // or stray entry must not sink the whole lookup.
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let is_png = matches!(path.extension().and_then(|ext| ext.to_str()), Some(ext) if ext.eq_ignore_ascii_case("png"));
         if !is_png {
             continue;
         }
-        let mtime = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .with_context(|| format!("cannot stat {}", path.display()))?;
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
         let newer = match &best {
             Some((t, _)) => mtime > *t,
             None => true,
