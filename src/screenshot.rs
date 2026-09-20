@@ -149,7 +149,7 @@ const SCREENSHOT_BACKEND_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND";
 
 /// Opt-in hotkey fallback: when set (value documents the bound GNOME key),
 /// the `hotkey-file` backend runs last and reads back the freshest PNG from
-/// ~/Pictures/Screenshots. The caller must trigger the hotkey first, then
+/// screenshots folder (XDG user dirs, else ~/Pictures/Screenshots). The caller must trigger the hotkey first, then
 /// call capture promptly; see issue #3.
 const HOTKEY_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY";
 /// Freshness window for the hotkey fallback: only screenshots newer than
@@ -264,7 +264,8 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // unknown bus names, and the portal cancels with response code 2 when it
     // cannot show its approval dialog without a focused app window.
     // gnome-screenshot works regardless when installed, so it stays the
-    // final fallback. See #1 (and upstream agent-sh/computer-use-linux#20).
+    // final automatic fallback; only the opt-in hotkey backend runs after it.
+    // See #1 (and upstream agent-sh/computer-use-linux#20).
     let chain = chain_with_opt_in(hotkey_opt_in());
     let mut failures = Vec::new();
     for backend in chain {
@@ -352,10 +353,56 @@ pub fn prepare_screenshot_payload(
 }
 
 fn screenshots_dir() -> Option<PathBuf> {
-    let pictures = std::env::var_os("XDG_PICTURES_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures")))?;
+    let pictures = user_pictures_dir().or_else(|| {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures"))
+    })?;
     Some(pictures.join("Screenshots"))
+}
+
+/// Pictures dir honoring an explicit `XDG_PICTURES_DIR` override, then the
+/// `XDG_PICTURES_DIR` entry of `user-dirs.dirs`. Pure apart from env reads
+/// (no mutation), so it stays parallel-test safe.
+fn user_pictures_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_PICTURES_DIR").map(PathBuf::from) {
+        return Some(dir);
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    parse_user_dirs_pictures(&config.join("user-dirs.dirs"))
+}
+
+/// `XDG_PICTURES_DIR` value from a `user-dirs.dirs` file, with `$HOME`
+/// expansion. A value equal to `$HOME` means disabled per the spec and is
+/// skipped. Pure for unit tests.
+fn parse_user_dirs_pictures(path: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home_str = home.to_string_lossy();
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("XDG_PICTURES_DIR=") else {
+            continue;
+        };
+        let value = rest.trim().trim_matches('"');
+        if value.is_empty() {
+            continue;
+        }
+        let expanded = value.replace("${HOME}", &home_str).replace("$HOME", &home_str);
+        if expanded == home_str {
+            continue;
+        }
+        let expanded = PathBuf::from(expanded);
+        return Some(if expanded.is_absolute() {
+            expanded
+        } else {
+            PathBuf::from(&home).join(expanded)
+        });
+    }
+    None
 }
 
 /// Newest `.png` in `dir` modified after `since`. Pure filesystem lookup so it
