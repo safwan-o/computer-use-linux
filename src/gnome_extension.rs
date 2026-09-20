@@ -425,6 +425,14 @@ mod tests {
     }
 
     #[test]
+    fn embedded_extension_exposes_screenshot_capture() {
+        let rendered = render_extension_asset(EXTENSION_JS);
+
+        assert!(rendered.contains("CaptureScreenshot"));
+        assert!(rendered.contains("new Shell.Screenshot()"));
+    }
+
+    #[test]
     fn rendered_extension_uses_build_identity() {
         let rendered = render_extension_asset(EXTENSION_JS);
 

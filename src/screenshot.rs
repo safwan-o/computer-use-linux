@@ -144,11 +144,12 @@ impl ScreenshotPayloadOptions {
 }
 
 /// Environment variable forcing a single capture backend, skipping the
-/// fallback chain. Accepts `gnome-shell`, `portal`, or `gnome-screenshot`.
+/// fallback chain. Accepts `shell-extension`, `gnome-shell`, `portal`, or `gnome-screenshot`.
 const SCREENSHOT_BACKEND_ENV: &str = "COMPUTER_USE_LINUX_SCREENSHOT_BACKEND";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenshotBackend {
+    ShellExtension,
     GnomeShell,
     Portal,
     GnomeScreenshot,
@@ -157,6 +158,7 @@ enum ScreenshotBackend {
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "shell-extension" | "shell_extension" | "extension" => Some(Self::ShellExtension),
             "gnome-shell" | "gnome_shell" | "shell" => Some(Self::GnomeShell),
             "portal" | "xdg-portal" | "xdg_portal" => Some(Self::Portal),
             "gnome-screenshot" | "gnome_screenshot" => Some(Self::GnomeScreenshot),
@@ -166,11 +168,57 @@ impl ScreenshotBackend {
 
     async fn capture(self) -> Result<RawScreenshotCapture> {
         match self {
+            Self::ShellExtension => capture_with_shell_extension().await,
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::Portal => capture_with_portal().await,
             Self::GnomeScreenshot => capture_with_gnome_screenshot().await,
         }
     }
+}
+
+impl ScreenshotBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ShellExtension => "shell-extension",
+            Self::GnomeShell => "gnome-shell",
+            Self::Portal => "xdg-desktop-portal",
+            Self::GnomeScreenshot => "gnome-screenshot",
+        }
+    }
+}
+
+/// Default capture order, tried front to back by capture_screenshot_raw.
+/// New backends (e.g. a PipeWire ScreenCast backend for background callers,
+/// see issue #1) slot in here without touching the fallback loop.
+const DEFAULT_SCREENSHOT_CHAIN: [ScreenshotBackend; 4] = [
+    ScreenshotBackend::ShellExtension,
+    ScreenshotBackend::GnomeShell,
+    ScreenshotBackend::Portal,
+    ScreenshotBackend::GnomeScreenshot,
+];
+
+#[derive(Debug)]
+struct BackendFailure {
+    backend: ScreenshotBackend,
+    error: anyhow::Error,
+}
+
+/// Collapse per-backend failures into a single actionable error.
+///
+/// Stacked backend errors bury the actual cause (on Wayland this is almost
+/// always the portal approval dialog never being shown for background
+/// callers). Name each backend, keep its reason, and point at the remedies.
+fn actionable_screenshot_error(failures: &[BackendFailure]) -> anyhow::Error {
+    let mut message = String::from(
+        "screenshot capture failed on all backends. On Wayland this usually means the caller is a background process: GNOME Shell rejects unknown D-Bus callers and the XDG portal cannot show its approval dialog without a focused app window."
+    );
+    for failure in failures {
+        message.push_str(&format!(" {} failed: {:#};", failure.backend.name(), failure.error));
+    }
+    message.push_str(
+        " Remedies: focus a window and approve the portal dialog once; install gnome-screenshot as a fallback; pin a single backend with COMPUTER_USE_LINUX_SCREENSHOT_BACKEND to debug; or as a manual fallback bind a GNOME screenshot hotkey and read back ~/Pictures/Screenshots. See issue #1."
+    );
+    anyhow!("{}", message)
 }
 
 pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
@@ -184,29 +232,20 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     }
 
     // The Shell and portal DBus paths fail for background processes (systemd
-    // user services, non-interactive parent shells): GNOME Shell's
-    // DBusSenderChecker rejects unknown bus names, and the portal cancels with
-    // response code 2 when there is no foreground window. `gnome-screenshot`
-    // claims an allowlisted bus name and works regardless, so it is the final
-    // fallback. See issue #20.
-    let gnome_error = match capture_with_gnome_shell().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
-    let portal_error = match capture_with_portal().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
-    let cli_error = match capture_with_gnome_screenshot().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
+    // user services, non-interactive parent shells): GNOME Shell rejects
+    // unknown bus names, and the portal cancels with response code 2 when it
+    // cannot show its approval dialog without a focused app window.
+    // gnome-screenshot works regardless when installed, so it stays the
+    // final fallback. See #1 (and upstream agent-sh/computer-use-linux#20).
+    let mut failures = Vec::new();
+    for backend in DEFAULT_SCREENSHOT_CHAIN {
+        match backend.capture().await {
+            Ok(capture) => return Ok(capture),
+            Err(error) => failures.push(BackendFailure { backend, error }),
+        }
+    }
 
-    Err(anyhow!(
-        "GNOME Shell screenshot failed: {gnome_error}; \
-         XDG portal screenshot failed: {portal_error}; \
-         gnome-screenshot fallback failed: {cli_error}"
-    ))
+    Err(actionable_screenshot_error(&failures))
 }
 
 fn forced_backend() -> Result<Option<ScreenshotBackend>> {
@@ -281,6 +320,52 @@ pub fn prepare_screenshot_payload(
         format: options.format,
         quality: (options.format == ScreenshotOutputFormat::Jpeg).then_some(options.quality),
     })
+}
+
+async fn capture_with_shell_extension() -> Result<RawScreenshotCapture> {
+    // In-process capture through the companion GNOME Shell extension: no
+    // D-Bus sender check and no portal approval dialog, so this works for
+    // background callers whenever the extension is active. Falls through to
+    // the other backends when the extension API is unavailable.
+    let connection = zbus::Connection::session()
+        .await
+        .context("failed to connect to session bus")?;
+    let proxy = Proxy::new(
+        &connection,
+        crate::identity::DBUS_SERVICE,
+        crate::identity::DBUS_OBJECT_PATH,
+        crate::identity::DBUS_SERVICE,
+    )
+    .await
+    .context("failed to create companion extension screenshot proxy")?;
+    let path = temp_png_path("shell-extension");
+    let filename = path
+        .to_str()
+        .context("temporary screenshot path is not valid UTF-8")?;
+    let args = (false, filename);
+    let call = proxy.call("CaptureScreenshot", &args);
+    let (ok, message): (bool, String) = match tokio::time::timeout(SHELL_EXTENSION_TIMEOUT, call).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            cleanup_gnome_requested_path(&path);
+            return Err(error).context("companion extension CaptureScreenshot call failed");
+        }
+        Err(_) => {
+            cleanup_gnome_requested_path(&path);
+            bail!("companion extension screenshot timed out");
+        }
+    };
+    if !ok {
+        cleanup_gnome_requested_path(&path);
+        bail!("companion extension screenshot failed: {message}");
+    }
+
+    read_png_as_capture(
+        path.clone(),
+        "shell-extension",
+        ScreenshotCleanup::DeletePath(path),
+    )
+    .await
 }
 
 async fn capture_with_gnome_shell() -> Result<RawScreenshotCapture> {
@@ -369,6 +454,11 @@ async fn capture_with_portal() -> Result<RawScreenshotCapture> {
 
     read_png_as_capture(path, "xdg-desktop-portal", ScreenshotCleanup::Preserve).await
 }
+
+/// Upper bound on how long we wait for the companion extension to answer
+/// before falling through to the next backend. Matches the portal timeout:
+/// a hung capture must not block the tool forever.
+const SHELL_EXTENSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Upper bound on how long we wait for `gnome-screenshot` before killing it.
 /// Matches the portal timeout: a hung capture must not block the tool forever.
@@ -744,7 +834,42 @@ mod tests {
             ScreenshotBackend::parse("GNOME_SCREENSHOT"),
             Some(ScreenshotBackend::GnomeScreenshot)
         );
+        assert_eq!(
+            ScreenshotBackend::parse("shell-extension"),
+            Some(ScreenshotBackend::ShellExtension)
+        );
         assert_eq!(ScreenshotBackend::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn default_chain_covers_all_backends_in_order() {
+        assert_eq!(
+            DEFAULT_SCREENSHOT_CHAIN,
+            [
+                ScreenshotBackend::ShellExtension,
+                ScreenshotBackend::GnomeShell,
+                ScreenshotBackend::Portal,
+                ScreenshotBackend::GnomeScreenshot,
+            ]
+        );
+        let names: Vec<_> = DEFAULT_SCREENSHOT_CHAIN.iter().map(|b| b.name()).collect();
+        assert_eq!(names, ["shell-extension", "gnome-shell", "xdg-desktop-portal", "gnome-screenshot"]);
+    }
+
+    #[test]
+    fn aggregated_error_names_backends_and_points_at_remedies() {
+        let failures = vec![
+            BackendFailure { backend: ScreenshotBackend::ShellExtension, error: anyhow!("companion extension CaptureScreenshot call failed") },
+            BackendFailure { backend: ScreenshotBackend::GnomeShell, error: anyhow!("AccessDenied: Screenshot is not allowed") },
+            BackendFailure { backend: ScreenshotBackend::Portal, error: anyhow!("denied or cancelled with response code 2") },
+            BackendFailure { backend: ScreenshotBackend::GnomeScreenshot, error: anyhow!("failed to spawn gnome-screenshot") },
+        ];
+        let message = actionable_screenshot_error(&failures).to_string();
+        for backend in DEFAULT_SCREENSHOT_CHAIN {
+            assert!(message.contains(backend.name()));
+        }
+        assert!(message.contains("focused app"));
+        assert!(message.contains(SCREENSHOT_BACKEND_ENV));
     }
 
     #[test]
