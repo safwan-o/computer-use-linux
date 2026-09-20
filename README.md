@@ -386,7 +386,7 @@ Most setups need none of these — `doctor` and the installers pick sensible def
 | `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD` | Prefer `xdotool`/XTEST keyboard input when `DISPLAY` is available. `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1` takes precedence. |
 | `COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS` | Per-character delay for `xdotool type` in milliseconds (default `12`). `0` is faster but can deliver characters out of order on some X servers. |
 | `COMPUTER_USE_LINUX_SCREENSHOT_BACKEND` | Force a single screenshot backend, skipping the fallback chain. Accepts `shell-extension`, `gnome-shell`, `portal`, `gnome-screenshot`, or `hotkey-file`. The companion GNOME Shell extension is tried first by default and captures in-process with no portal approval. |
-| `COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY` | Opt into the last-resort `hotkey-file` screenshot backend (e.g. `alt-f12`). Bind the value as a GNOME screenshot hotkey first; the backend then reads back the freshest PNG from `~/Pictures/Screenshots` (30s freshness window, never deleted). Unset by default: the backend is skipped entirely. |
+| `COMPUTER_USE_LINUX_SCREENSHOT_HOTKEY` | Opt into the last-resort `hotkey-file` screenshot backend (e.g. `alt-f12`). Bind the value as a GNOME screenshot hotkey first; the backend then reads back the freshest PNG from the XDG Screenshots folder (usually `~/Pictures/Screenshots`; 30s freshness window, never deleted). Unset by default: the backend is skipped entirely. |
 | `COMPUTER_USE_LINUX_ENABLE_SHELL` | Set exactly to `1` before starting the MCP server to register the destructive `run_shell` tool. Unset by default. Do not enable for untrusted or unattended MCP hosts. |
 
 **Build-time identity overrides** (set while compiling a downstream embedded
